@@ -1,0 +1,4 @@
+# Track only the HTML simulation; ignore CAD and other assets
+*
+!.gitignore
+!*.html
