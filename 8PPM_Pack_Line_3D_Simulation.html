@@ -108,7 +108,7 @@ select.btn{appearance:none;-webkit-appearance:none;padding-right:22px;background
       </div>
       <button class="btn" id="play" aria-label="Pause simulation">❚❚ Pause</button>
       <select class="btn" id="speed" aria-label="Simulation speed">
-        <option value="10">10×</option><option value="30">30×</option><option value="60" selected>60×</option><option value="150">150×</option><option value="400">400×</option>
+        <option value="1">1× real time</option><option value="3">3×</option><option value="10" selected>10×</option><option value="30">30×</option><option value="60">60×</option><option value="150">150×</option><option value="400">400×</option>
       </select>
       <select class="btn" id="view" aria-label="Camera view">
         <option value="overview">Overview</option>
@@ -1281,6 +1281,7 @@ const stage = document.getElementById('stage');
 const renderer = new THREE.WebGLRenderer({antialias:true});
 renderer.setPixelRatio(Math.min(devicePixelRatio,2));
 renderer.outputEncoding = THREE.sRGBEncoding;
+renderer.toneMapping = THREE.ACESFilmicToneMapping; renderer.toneMappingExposure = 0.82;
 renderer.shadowMap.enabled = true; renderer.shadowMap.type = THREE.PCFSoftShadowMap;
 stage.prepend(renderer.domElement);
 const scene = new THREE.Scene();
@@ -1347,7 +1348,8 @@ function updateLabels(){
 /* ---------------- Simulation state ---------------- */
 let P = {ppm:8, cpm:26, mpp:2};
 const T = () => ({cell:60/P.ppm, mod:P.cpm*60/P.ppm, pack:P.mpp*P.cpm*60/P.ppm});
-let simTime=0, speed=60, playing=true;
+let simTime=0, speed=10, playing=true;
+let workers=[], robots=[], sparks=[], walkers=[], andons=[];
 let lines=[], forklift=null, agv=null, finished=[], finishedCount=0, cellsTotal=0;
 let focusLine=0, selected=null, cfg=null, optKey='B';
 const V_CONV = 0.25; // m/s conveyor speed (sim time)
@@ -1443,14 +1445,82 @@ function buildRacks(r){
 }
 function mulberry(a){return function(){a|=0;a=a+0x6D2B79F5|0;let t=Math.imul(a^a>>>15,1|a);t=t+Math.imul(t^t>>>7,61|t)^t;return((t^t>>>14)>>>0)/4294967296;}}
 
-function operator(x,z,faceZ,parent){
+/* Articulated worker: hips, legs, torso, neck/head, shoulders and elbows are separate pivots so they can be animated */
+const G = { leg:new THREE.CylinderGeometry(.065,.058,.8,10), uarm:new THREE.CylinderGeometry(.05,.045,.3,10), farm:new THREE.CylinderGeometry(.044,.04,.27,10),
+  torso:new THREE.CylinderGeometry(.17,.15,.6,14), head:new THREE.SphereGeometry(.105,14,10), hat:new THREE.SphereGeometry(.115,14,8,0,Math.PI*2,0,Math.PI/2), hand:new THREE.SphereGeometry(.045,10,8) };
+function operator(x,z,faceZ,parent,shirt){
   const g = new THREE.Group(); g.position.set(x,0,z);
-  const body = mat('opBody',0x2f6db5), skin = mat('opSkin',0xe8c4a0), cap = mat('opCap',0xf2f2ee);
-  cyl(.13,.8,mat('opLeg',0x2b3440),0,.4,0,g); cyl(.19,.62,body,0,1.12,0,g);
-  const head = new THREE.Mesh(new THREE.SphereGeometry(.12,14,10),skin); head.position.y=1.56; head.castShadow=true; g.add(head);
-  const hat = new THREE.Mesh(new THREE.SphereGeometry(.125,14,8,0,Math.PI*2,0,Math.PI/2),cap); hat.position.y=1.6; g.add(hat);
-  g.rotation.y = faceZ>0?0:Math.PI; (parent||root).add(g); return g;
+  const body = shirt || mat('opBody',0x2f6db5), skin = mat('opSkin',0xd9ad86), cap = mat('opCap',0xf2f2ee), legM = mat('opLeg',0x2b3440), shoe = mat('shoe',0x1d1f22);
+  const limb = (geo,len,m,pg)=>{ const c=new THREE.Mesh(geo,m); c.position.y=-len/2; c.castShadow=true; pg.add(c); return c; };
+  const hipL=new THREE.Group(), hipR=new THREE.Group(); hipL.position.set(-.09,.84,0); hipR.position.set(.09,.84,0); g.add(hipL,hipR);
+  limb(G.leg,.8,legM,hipL); limb(G.leg,.8,legM,hipR);
+  box(.11,.06,.24,shoe,0,-.81,.045,hipL); box(.11,.06,.24,shoe,0,-.81,.045,hipR);
+  const upper=new THREE.Group(); upper.position.y=.84; g.add(upper);
+  const torso=new THREE.Mesh(G.torso,body); torso.position.y=.3; torso.castShadow=true; upper.add(torso);
+  const neck=new THREE.Group(); neck.position.y=.62; upper.add(neck);
+  const head=new THREE.Mesh(G.head,skin); head.position.y=.11; head.castShadow=true; neck.add(head);
+  const hat=new THREE.Mesh(G.hat,cap); hat.position.y=.14; neck.add(hat);
+  const arm=(sx)=>{ const sh=new THREE.Group(); sh.position.set(sx,.56,0); upper.add(sh); limb(G.uarm,.3,body,sh);
+    const el=new THREE.Group(); el.position.y=-.3; sh.add(el); limb(G.farm,.27,body,el);
+    const hd=new THREE.Mesh(G.hand,skin); hd.position.y=-.3; el.add(hd); return [sh,el]; };
+  const [shL,elL]=arm(-.21), [shR,elR]=arm(.21);
+  g.rotation.y = faceZ>0?0:Math.PI; (parent||root).add(g);
+  return {g, upper, neck, shL, elL, shR, elR, hipL, hipR, phase: Math.random()*6.28};
 }
+const approach = (o,k,target,rate) => { o[k] += (target-o[k])*rate; };
+function poseWorker(w, now, dt, mode){
+  const t = now/1000 + w.phase, r = Math.min(1, dt*7);
+  let up=.02, shl=-.06, shr=-.06, ell=-.12, elr=-.12, nx=0, ny=0, hl=0, hr=0;
+  if(mode==='work'){
+    const a=Math.sin(t*2.4), b=Math.sin(t*2.4+2.1);
+    up=.2+.05*Math.sin(t*1.1); shl=-.85-.32*a; ell=-.85+.38*a; shr=-.85-.32*b; elr=-.85+.38*b; nx=.32; ny=.18*Math.sin(t*.6);
+  } else if(mode==='walk' || mode==='push'){
+    const s=Math.sin(t*6.4); hl=.42*s; hr=-.42*s; up=.06;
+    if(mode==='push'){ shl=shr=-1.15; ell=elr=-.35; } else { shl=-.32*s; shr=.32*s; ell=elr=-.25; }
+    w.g.position.y = Math.abs(Math.cos(t*6.4))*.025;
+  } else {
+    up=.02*Math.sin(t*.9); ny=.65*Math.sin(t*.21)*Math.sin(t*.13); nx=.05;
+  }
+  approach(w.upper.rotation,'x',up,r); approach(w.shL.rotation,'x',shl,r); approach(w.shR.rotation,'x',shr,r);
+  approach(w.elL.rotation,'x',ell,r); approach(w.elR.rotation,'x',elr,r); approach(w.neck.rotation,'x',nx,r); approach(w.neck.rotation,'y',ny,r*.5);
+  approach(w.hipL.rotation,'x',hl,r); approach(w.hipR.rotation,'x',hr,r);
+}
+
+/* Six-axis style robot: pedestal → turret (yaw) → shoulder → elbow → wrist, reaching along turret +x */
+function makeRobot(parent, x, z, scale){
+  const rm = mat('robotC',0xe8a000,{roughness:.42,metalness:.25}), dark = mat('robBase',0x3a4048,{roughness:.5,metalness:.4});
+  const base = new THREE.Group(); base.position.set(x,0,z); base.scale.setScalar(scale||1); parent.add(base);
+  const hit = box(.46,.5,.46,dark,0,.25,0,base);
+  const turret = new THREE.Group(); turret.position.y=.5; base.add(turret);
+  cyl(.18,.2,rm,0,.1,0,turret);
+  const sh = new THREE.Group(); sh.position.y=.24; turret.add(sh);
+  cyl(.1,.2,dark,0,0,0,sh).rotation.x=Math.PI/2;
+  box(.15,.66,.15,rm,0,.33,0,sh);
+  const el = new THREE.Group(); el.position.y=.66; sh.add(el);
+  cyl(.08,.18,dark,0,0,0,el).rotation.x=Math.PI/2;
+  box(.12,.56,.12,rm,0,.28,0,el);
+  const wr = new THREE.Group(); wr.position.y=.56; el.add(wr);
+  box(.1,.12,.1,dark,0,.06,0,wr); box(.04,.16,.04,mat('tool',0xcfd4d8,{metalness:.8,roughness:.25}),0,.2,0,wr);
+  const grip = box(.16,.03,.1,mat('tool',0xcfd4d8),0,.28,0,wr);
+  return {base, turret, sh, el, wr, grip, hit};
+}
+/* yaw: turret heading (rad); reach 0..1 how far out; dip 0..1 lowers the tool */
+function poseRobot(R, yaw, reach, dip){
+  const a = -(0.35 + 0.75*reach), b = -(1.45 - 0.55*reach) - 0.35*dip;
+  R.turret.rotation.y = yaw; R.sh.rotation.z = a; R.el.rotation.z = b; R.wr.rotation.z = -Math.PI - a - b;
+}
+const smooth = u => u<=0?0:u>=1?1:u*u*(3-2*u);
+function stripeTex(fg,bg,frac){
+  const c=document.createElement('canvas'); c.width=64; c.height=4; const x=c.getContext('2d');
+  x.fillStyle=bg; x.fillRect(0,0,64,4); x.fillStyle=fg; x.fillRect(0,0,64*frac,4);
+  const t=new THREE.CanvasTexture(c); t.wrapS=t.wrapT=THREE.RepeatWrapping; t.encoding=THREE.sRGBEncoding; return t;
+}
+const BELT = {
+  cell: new THREE.MeshStandardMaterial({map:stripeTex('#3b4248','#23272b',.18),roughness:.85}),
+  mod:  new THREE.MeshStandardMaterial({map:stripeTex('#3b4248','#23272b',.18),roughness:.85}),
+  roll: new THREE.MeshStandardMaterial({map:stripeTex('#d2d7dc','#6b737a',.5),roughness:.3,metalness:.7})
+};
+BELT.cell.map.repeat.set((CELL_X1-CELL_X0)/0.25,1); BELT.mod.map.repeat.set((MOD_X1-MOD_X0)/0.25,1); BELT.roll.map.repeat.set((PACK_X1-PACK_X0)/0.09,1);
 
 function buildLine(o, k){
   const dx=o.dx, dy=o.dys[k];
@@ -1458,12 +1528,12 @@ function buildLine(o, k){
   const g = new THREE.Group(); root.add(g);
   const frame = mat('convFrame',0x3d4650,{metalness:.4,roughness:.45}), belt = mat('belt',0x2a2f33,{roughness:.9}), roller=mat('roller',0x9aa1a8,{metalness:.6,roughness:.35});
   // conveyors
-  const conv = (xa,xb,z,w,h)=>{ box(xb-xa,.06,w,belt,(xa+xb)/2,h,z,g); box(xb-xa,.1,.05,frame,(xa+xb)/2,h-.04,z-w/2,g); box(xb-xa,.1,.05,frame,(xa+xb)/2,h-.04,z+w/2,g);
+  const conv = (xa,xb,z,w,h,bm)=>{ box(xb-xa,.06,w,bm||belt,(xa+xb)/2,h,z,g); box(xb-xa,.1,.05,frame,(xa+xb)/2,h-.04,z-w/2,g); box(xb-xa,.1,.05,frame,(xa+xb)/2,h-.04,z+w/2,g);
     for(let x=xa+.4;x<xb;x+=1.6){ box(.05,h,.05,frame,x,h/2,z-w/2+.03,g); box(.05,h,.05,frame,x,h/2,z+w/2-.03,g);} };
-  conv(X(CELL_X0),X(CELL_X1),Zu,.36,.8);
-  conv(X(MOD_X0),X(MOD_X1),Zu,.62,.8);
+  conv(X(CELL_X0),X(CELL_X1),Zu,.36,.8,BELT.cell);
+  conv(X(MOD_X0),X(MOD_X1),Zu,.62,.8,BELT.mod);
   // pack line: roller conveyor with double-deck return
-  box(X(PACK_X1)-X(PACK_X0),.08,1.2,roller,(X(PACK_X0)+X(PACK_X1))/2,.62,Zl,g);
+  box(X(PACK_X1)-X(PACK_X0),.08,1.2,BELT.roll,(X(PACK_X0)+X(PACK_X1))/2,.62,Zl,g);
   box(X(PACK_X1)-X(PACK_X0),.12,.06,frame,(X(PACK_X0)+X(PACK_X1))/2,.58,Zl-.62,g); box(X(PACK_X1)-X(PACK_X0),.12,.06,frame,(X(PACK_X0)+X(PACK_X1))/2,.58,Zl+.62,g);
   box(X(PACK_X1)-X(PACK_X0),.05,1.1,belt,(X(PACK_X0)+X(PACK_X1))/2,.22,Zl,g);
   for(let x=X(PACK_X0)+.3;x<X(PACK_X1);x+=2){ box(.06,.62,.06,frame,x,.31,Zl-.6,g); box(.06,.62,.06,frame,x,.31,Zl+.6,g); }
@@ -1497,9 +1567,9 @@ function buildLine(o, k){
     switch(s.kind){
       case 'mini': hit.push(box(.55,1.1,.9,shell,0,1.35,0,sg)); box(.56,.12,.91,band,0,1.95,0,sg); topY=2.1; break;
       case 'chute': hit.push(box(.5,.9,.7,shell,0,1.3,0,sg)); topY=1.9; break;
-      case 'robot': { const base = s.track==='pack'? -1.6 : -.75; const zz = s.track==='pack'? 0 : 0;
-          hit.push(box(.5,.7,.5,mat('robBase',0x404850),0,.35,base,sg)); const arm=box(.16,1.0,.16,mat('robot',0xe8a000),0,1.1,base,sg); arm.rotation.x=.5; hit.push(arm);
-          const arm2=box(.12,.8,.12,mat('robot',0xe8a000),0,1.6,base+.45,sg); arm2.rotation.x=1.6; sg.userData.arm=arm2;
+      case 'robot': { const bz = s.track==='pack'? -1.55 : -.72;
+          const R = makeRobot(sg, 0, bz, s.track==='pack'? 1.45 : .95); hit.push(R.hit);
+          robots.push({R, line:k, id:s.id, kind: s.track==='pack'?'glue':'xfer', bz, phase:Math.random()});
           if(s.track==='pack'){ for(const [fx,fz,fw,fd] of [[0,-2.4,2.4,.04],[-1.2,-1.8,.04,1.2],[1.2,-1.8,.04,1.2]]) box(fw,1.4,fd,mat('fence',0xe0a100,{transparent:true,opacity:.6}),fx,.7,fz,sg); }
           topY=2.2; break; }
       case 'bench2': for(const oy of s.ops){ const bz = Z(oy)-zc; hit.push(box(.8,.78,.6,mat('bench',0xdedbd2),0,.39,bz*.55,sg)); } topY=1.6; break;
@@ -1512,14 +1582,24 @@ function buildLine(o, k){
       case 'lift': hit.push(box(2.2,.1,1.3,mat('liftDeck',0x5b6670),0,.75,0,sg)); topY=3.3; break;
       case 'mini2': break;
     }
-    for(const oy of s.ops){ const oz = Z(oy)-zc; operator(0,oz*1.0+(oz>0?.25:-.25),-oz,sg); }
-    if(s.kind==='manual' && s.track==='cell'){ operator(0,.7,-1,sg); }
-    // status beacon
-    const beacon = new THREE.Mesh(new THREE.SphereGeometry(.11,12,8), new THREE.MeshStandardMaterial({color:0x8b958f,emissive:0x000000,roughness:.4}));
-    beacon.position.set(0,topY,0); sg.add(beacon);
+    for(const oy of s.ops){ const oz = Z(oy)-zc; workers.push({w:operator(0,oz*1.0+(oz>0?.25:-.25),-oz,sg), line:k, id:s.id}); }
+    if(s.kind==='manual' && s.track==='cell'){ workers.push({w:operator(-.9,.75,-1,sg), line:k, id:s.id}); }
+    // laser process light (weld + clean)
+    if(s.id==='weld' || s.id==='clean'){
+      const spark = new THREE.Mesh(new THREE.SphereGeometry(.05,10,8), new THREE.MeshBasicMaterial({color: s.id==='weld'?0xd8f0ff:0xb8ffcf}));
+      spark.position.set(0,1.0,0); spark.visible=false; sg.add(spark);
+      let light=null; if(s.id==='weld'){ light = new THREE.PointLight(0x9fd8ff,0,4.5,2); light.position.set(0,1.3,0); sg.add(light); }
+      sparks.push({spark, light, line:k, id:s.id});
+    }
+    // andon stack light (red / amber / green) on a pole at the station's back corner
+    const ax = s.track==='pack' ? 1.15 : .7, az = s.track==='pack' ? -0.75 : -.95, ay = Math.max(1.6, topY-.25);
+    box(.035,ay,.035,mat('pole',0x5b646c,{metalness:.5}),ax,ay/2,az,sg);
+    const lens = (col,dim,y)=>{ const m=new THREE.Mesh(new THREE.CylinderGeometry(.055,.055,.085,14), new THREE.MeshStandardMaterial({color:dim,emissive:col,emissiveIntensity:0,roughness:.3})); m.position.set(ax,ay+y,az); sg.add(m); return m.material; };
+    const lights = {g:lens(0x22ff66,0x1e3326,.05), a:lens(0xffb000,0x3a2f14,.14), r:lens(0xff3020,0x3a1a17,.23)};
+    box(.11,.02,.11,mat('pole',0x5b646c),ax,ay+.28,az,sg);
     hit.forEach(h=>h.userData.st = {line:k, id:s.id});
     const L = addLabel('station', 0,0,0, s.en, s.cn, {line:k, id:s.id}); L.pos.set(x, topY+.35, zc);
-    stations[s.id] = {def:s, group:sg, beacon, label:L, x, z:zc, busy:0, blocked:0, starved:0, status:'starved', hits:hit};
+    stations[s.id] = {def:s, group:sg, lights, label:L, x, z:zc, busy:0, blocked:0, starved:0, status:'starved', hits:hit};
   }
   addLabel('line', X(-127.5), 1.2, (Zu+Zl)/2, `LINE ${k+1}`, `${k+1}号线`, {line:k});
 
@@ -1532,12 +1612,17 @@ function buildLine(o, k){
     mod:{stops:modStops.map(s=>Object.assign(s,{occ:null})), items:[]},
     pack:{stops:packStops.map(s=>Object.assign(s,{occ:null})), items:[]},
     gantry:{state:'idle', t:0, item:null, bridge, gripper, rope, x0:X(-95.8), x1:stations.box.x},
-    outQ:[], packsOut:0, partial: null };
+    outQ:[], packsOut:0, partial: null, offAnim:[] };
 }
 
 /* ---------------- Part meshes ---------------- */
 const cellGeo = new THREE.BoxGeometry(.072,.2,.174);
-function makeCell(){ const m=new THREE.Mesh(cellGeo, mat('cellM',0x3e74b8,{roughness:.5,metalness:.2})); m.castShadow=true; return m; }
+function makeCell(){
+  const m=new THREE.Mesh(cellGeo, mat('cellM',0x3e74b8,{roughness:.5,metalness:.2})); m.castShadow=true;
+  box(.034,.016,.04,mat('termNeg',0xb8bec4,{metalness:.8,roughness:.3}),0,.107,-.055,m,false);
+  box(.034,.016,.04,mat('termPos',0xc8432f,{metalness:.5,roughness:.35}),0,.107,.055,m,false);
+  return m;
+}
 function moduleLen(){ return Math.min(P.cpm*.072+.08, 2.1); }
 function makeModule(){
   const g = new THREE.Group(), L = moduleLen();
@@ -1554,7 +1639,10 @@ function makePack(){
   const plate = box(L-.1,.02,Wd-.08,mat('plate',0x7fc6d6,{metalness:.5,roughness:.3}),0,.06,0,g); plate.visible=false;
   const glue = box(L-.2,.008,Wd-.18,mat('glueM',0xf3f0e6),0,.075,0,g); glue.visible=false;
   const lid = box(L+.02,.03,Wd+.02,mat('lid',0x8d99a5,{metalness:.4,roughness:.4}),0,.28,0,g); lid.visible=false;
-  g.userData = {plate, glue, lid, L, Wd, mods:[]};
+  const harn = new THREE.Group(); g.add(harn); harn.visible=false;
+  box(L*.8,.025,.04,mat('hvCable',0xe07b1a),0,.25,-Wd*.18,harn); box(L*.7,.02,.025,mat('lvCable',0x22262a),0,.25,Wd*.2,harn);
+  box(.12,.06,.1,mat('bmsBox',0x3a4048),L/2-.2,.26,0,harn);
+  g.userData = {plate, glue, lid, harn, L, Wd, mods:[]};
   return g;
 }
 
@@ -1575,6 +1663,7 @@ function stepTrack(line, track, dt){
     const st = tr.stops[it.i];
     if(it.state==='proc'){
       it.t -= dt;
+      progressVisual(track, it, st.id, it.t0 ? Math.max(0, Math.min(1, 1 - it.t/it.t0)) : 1);
       if(it.t<=0){ onDone(line, track, it, st.id); it.state='wait'; }
     }
     if(it.state==='needmods') continue;
@@ -1584,9 +1673,11 @@ function stepTrack(line, track, dt){
       if(!nx.occ){ st.occ=null; nx.occ=it; it.state='move'; it.target=it.i+1; }
     }
     if(it.state==='move'){
-      const nx = tr.stops[it.target];
-      it.x = Math.min(nx.x, it.x + V_CONV*dt);
-      if(it.x>=nx.x-1e-6){ it.i=it.target; it.state='proc'; it.t=dwellFor(line,track,nx.id); onArrive(line,track,it,nx.id); }
+      // trapezoidal motion: accelerate, cruise, decelerate into the stop
+      const nx = tr.stops[it.target], rem = Math.max(0, nx.x - it.x), A = 0.3;
+      it.v = Math.min(V_CONV, (it.v||0) + A*dt, Math.sqrt(2*A*rem) + 0.008);
+      it.x = Math.min(nx.x, it.x + it.v*dt);
+      if(it.x>=nx.x-1e-6){ it.v=0; it.i=it.target; it.state='proc'; it.t=it.t0=dwellFor(line,track,nx.id); onArrive(line,track,it,nx.id); }
     }
     it.mesh.position.x = it.x;
   }
@@ -1597,7 +1688,20 @@ function onArrive(line, track, it, id){
 function onDone(line, track, it, id){
   const u = it.mesh.userData;
   if(track==='mod'){ if(id==='stack') u.strap.visible=true; if(id==='ccs') u.ccs.visible=true; }
-  else { if(id==='cool') u.plate.visible=true; if(id==='glue') u.glue.visible=true; if(id==='cover') u.lid.visible=true; }
+  else { if(id==='cool') u.plate.visible=true; if(id==='glue'){ u.glue.visible=true; u.glue.scale.x=u.L-.2; u.glue.position.x=0; }
+         if(id==='harn') u.harn.visible=true; if(id==='cover'){ u.lid.visible=true; u.lid.position.y=.28; } }
+}
+/* what the part looks like part-way through a station */
+function progressVisual(track, it, id, p){
+  const u = it.mesh.userData;
+  if(track==='mod'){
+    if(id==='ccs' && p>.45) u.ccs.visible=true;
+  } else {
+    if(id==='cool' && p>.25) u.plate.visible=true;
+    if(id==='glue'){ const L=u.L-.2, q=Math.max(.02, Math.min(1,(p-.1)/.8)); u.glue.visible=p>.1; u.glue.scale.x=L*q; u.glue.position.x=-L/2+L*q/2; }
+    if(id==='harn' && p>.4) u.harn.visible=true;
+    if(id==='cover'){ const q=Math.min(1,Math.max(0,(p-.15)/.5)); u.lid.visible=p>.15; u.lid.position.y=.28+(1-smooth(q))*.75; }
+  }
 }
 function onEnd(line, track, it){
   const tr=line[track];
@@ -1608,10 +1712,24 @@ function onEnd(line, track, it){
       g.state='pick'; g.t=0; g.item=it; tr.stops[it.i].occ=null; tr.items.splice(tr.items.indexOf(it),1); g.target=box.occ; box.occ.inbound++;
     }
   } else {
-    // offline: move to outfeed stand
+    // offline: the lift raises the pack, carries it north onto the outfeed stand, then lowers it
     tr.stops[it.i].occ=null; tr.items.splice(tr.items.indexOf(it),1);
     line.packsOut++; finishedCount++;
-    it.mesh.position.set(line.X(-77.4), .5, line.Z(86.6)); line.outQ.push(it.mesh);
+    line.offAnim.push({m:it.mesh, t:0, x:it.mesh.position.x, z0:line.Zl, z1:line.Z(86.6)});
+  }
+}
+function stepOffline(line, dt){
+  const deck = line.stations.off.hits[0];
+  for(let i=line.offAnim.length-1;i>=0;i--){
+    const a=line.offAnim[i]; a.t += dt/24; const t=Math.min(1,a.t);
+    let y, z;
+    if(t<.25){ const u=smooth(t/.25); y=.66+u*.75; z=a.z0; deck.position.y=.75+u*.75; }
+    else if(t<.75){ const u=smooth((t-.25)/.5); y=1.41; z=a.z0+(a.z1-a.z0)*u; deck.position.y=1.5-u*.75; }
+    else { const u=smooth((t-.75)/.25); y=1.41-(1.41-.52)*u; z=a.z1; }
+    a.m.position.set(a.x, y, z);
+    if(a.t>=1){ line.offAnim.splice(i,1); line.outQ.push(a.m); deck.position.y=.75;
+      while(line.outQ.length>2){ const old=line.outQ.shift(); line.g.remove(old); } // extra packs collected by a second AGV
+    }
   }
 }
 function stepGantry(line, dt){
@@ -1631,7 +1749,7 @@ function stepGantry(line, dt){
     // drop module into pack
     m.rotation.set(0,0,0); target.mesh.add(m); m.position.set(0,.08,offZ);
     target.mods++; target.inbound--; target.mesh.userData.mods.push(m);
-    if(target.mods>=P.mpp){ target.state='proc'; target.t=dwellFor(line,'pack','box'); }
+    if(target.mods>=P.mpp){ target.state='proc'; target.t=target.t0=dwellFor(line,'pack','box'); }
     g.state='idle'; g.item=null; g.target=null; g.rope.scale.y=.4;
   }
 }
@@ -1647,7 +1765,7 @@ function stepCells(line, dt){
   if(!blocked && line.cellAcc >= t.cell){
     line.cellAcc -= t.cell;
     const c = makeCell(); c.position.set(line.X(CELL_X0+.3), .92, line.Zu); line.g.add(c);
-    line.cells.push({m:c, x:c.position.x, ng: Math.random()<.008}); cellsTotal++;
+    line.cells.push({m:c, x:c.position.x, ng: Math.random()<.008, flip: (cellsTotal%2)===1}); cellsTotal++;
   } else if(blocked) line.cellAcc = Math.min(line.cellAcc, t.cell);
   // move
   const xEnd = line.X(CELL_X1), xNG = line.X(-120.9);
@@ -1657,6 +1775,7 @@ function stepCells(line, dt){
     // simple spacing on belt
     const ahead = line.cells.find(o=>o!==c && !o.ng && o.x>c.x && o.x-c.x<.09);
     if(!ahead) c.x = Math.min(xEnd, c.x + V_CONV*dt);
+    if(c.flip && c.x > line.X(-119.95)) c.m.rotation.y = Math.min(Math.PI, c.m.rotation.y + dt*3);
     if(c.x>=xEnd && line.stackCount < P.cpm){ line.g.remove(c.m); line.cells.splice(i,1); line.stackCount++; continue; }
     c.m.position.x = c.x;
   }
@@ -1684,23 +1803,115 @@ function stepPackEntry(line){
 /* ---------------- Logistics vehicles ---------------- */
 function makeVehicle(kind){
   const g = new THREE.Group();
+  const tyre = mat('tyre',0x1b1d20,{roughness:.9});
+  const wheel = (x,z,r)=>{ const w=cyl(r,.14,tyre,x,r,z,g); w.rotation.x=Math.PI/2; return w; };
   if(kind==='fork'){
-    box(1.1,.9,.8,mat('forkBody',0xe0a100),0,.6,0,g); box(.6,1.1,.75,mat('forkCab',0x333a40),-.2,1.35,0,g);
-    box(.08,2.2,.6,mat('mast',0x404850),.6,1.1,0,g); box(.9,.06,.12,mat('mast',0x404850),1.05,.15,-.2,g); box(.9,.06,.12,mat('mast',0x404850),1.05,.15,.2,g);
-    const load = box(.85,.9,.95,mat('crate',0x3e74b8),1.1,.7,0,g); g.userData.load=load;
+    const yel = mat('forkBody',0xe0a100,{roughness:.5}), dark = mat('mast',0x3a4048,{metalness:.4,roughness:.5});
+    box(1.25,.6,.9,yel,-.1,.45,0,g); box(.45,.7,.9,mat('counterW',0x2c3136),-.62,.5,0,g);
+    [[.35,.38],[.35,-.38],[-.6,.38],[-.6,-.38]].forEach(([x,z])=>wheel(x,z,.17));
+    for(const [x,z] of [[.3,.4],[.3,-.4],[-.45,.4],[-.45,-.4]]) box(.04,1.25,.04,dark,x,1.35,z,g);
+    box(.85,.04,.86,dark,-.08,1.97,0,g);
+    const drv = operator(-.18,0,1,g,mat('vest',0xf08a24)); drv.g.rotation.y=Math.PI/2; drv.g.position.y=-.05;
+    drv.hipL.rotation.x=drv.hipR.rotation.x=-1.45; drv.shL.rotation.x=drv.shR.rotation.x=-.9; drv.elL.rotation.x=drv.elR.rotation.x=-.5;
+    box(.06,2.3,.08,dark,.62,1.15,-.28,g); box(.06,2.3,.08,dark,.62,1.15,.28,g);
+    const car = new THREE.Group(); car.position.set(.68,0,0); g.add(car);
+    box(.04,.5,.62,dark,0,.35,0,car); box(.95,.05,.12,dark,.48,.12,-.2,car); box(.95,.05,.12,dark,.48,.12,.2,car);
+    box(.9,.12,.95,mat('pallet',0xa8835a),.48,.21,0,car);
+    const load = box(.85,.85,.95,mat('crate',0x3e74b8),.48,.7,0,car);
+    g.userData.load=load; g.userData.carriage=car;
   } else {
-    box(1.6,.35,1.0,mat('agv',0xe07b1a),0,.2,0,g); box(1.62,.04,1.02,mat('agvTop',0x333a40),0,.39,0,g);
-    const load = box(1.5,.28,.9,mat('lid',0x8d99a5),0,.56,0,g); g.userData.load=load;
+    box(1.6,.3,1.0,mat('agv',0xe07b1a,{roughness:.5}),0,.2,0,g); box(1.62,.04,1.02,mat('agvTop',0x333a40),0,.37,0,g);
+    box(.05,.1,.9,mat('bumper',0x222222),.82,.12,0,g); box(.05,.1,.9,mat('bumper',0x222222),-.82,.12,0,g);
+    const beacon = new THREE.Mesh(new THREE.CylinderGeometry(.05,.05,.08,12), new THREE.MeshStandardMaterial({color:0x3a2f14,emissive:0xffa000,emissiveIntensity:0}));
+    beacon.position.set(.65,.43,.38); g.add(beacon); g.userData.beacon=beacon;
+    const load = makePack(); load.position.set(0,.39,0); load.userData.lid.visible=true; load.userData.plate.visible=true; g.add(load); g.userData.load=load;
   }
   g.traverse(o=>{ if(o.isMesh){o.castShadow=true;} });
   root.add(g); return {g, path:[], seg:0, s:0, wait:0, mode:0, idx:0};
 }
+/* material handler pushing a trolley around the perimeter aisle */
+function makeWalker(loop, startFrac){
+  const w = operator(0,0,1,root,mat('vest',0xf08a24));
+  const cart = new THREE.Group(); cart.position.set(0,0,.72); w.g.add(cart);
+  const steel = mat('cartF',0x8d969c,{metalness:.6,roughness:.35});
+  box(.62,.04,.9,steel,0,.32,.1,cart); box(.62,.04,.9,steel,0,.72,.1,cart);
+  box(.03,.85,.03,steel,-.3,.43,-.33,cart); box(.03,.85,.03,steel,.3,.43,-.33,cart); box(.62,.03,.03,steel,0,.95,-.36,cart);
+  box(.5,.3,.36,mat('crate',0x3e74b8),0,.5,0,cart); box(.5,.25,.36,mat('crateG',0x5a8f6a),0,.88,.28,cart);
+  const pts = loop.map(([x,y])=>new THREE.Vector3(wx(x),0,wz(y)));
+  let total=0; const lens=pts.map((p,i)=>{ const l=p.distanceTo(pts[(i+1)%pts.length]); total+=l; return l; });
+  return {w, pts, lens, total, s: total*startFrac};
+}
+function stepWalker(wk, dt){
+  wk.s = (wk.s + 1.1*dt) % wk.total;
+  let s=wk.s, i=0; while(s>wk.lens[i]){ s-=wk.lens[i]; i++; }
+  const a=wk.pts[i], b=wk.pts[(i+1)%wk.pts.length], u=s/wk.lens[i];
+  wk.w.g.position.x = a.x+(b.x-a.x)*u; wk.w.g.position.z = a.z+(b.z-a.z)*u;
+  const target = Math.atan2(b.x-a.x, b.z-a.z);
+  let d = target - wk.w.g.rotation.y; d = Math.atan2(Math.sin(d), Math.cos(d));
+  wk.w.g.rotation.y += d*Math.min(1, dt*3);
+}
+
+/* per-frame visual animation (real time, independent of simulation speed) */
+function animateVisuals(rdt, now){
+  const blink = (now % 900) < 450;
+  for(const line of lines) for(const id in line.stations){
+    const s=line.stations[id], L=s.lights;
+    L.g.emissiveIntensity = s.status==='busy' ? 2.2 : 0;
+    L.a.emissiveIntensity = s.status==='blocked' ? (blink?2.2:0.15) : 0;
+    L.r.emissiveIntensity = 0;
+  }
+  for(const o of workers){ const st=lines[o.line].stations[o.id]; poseWorker(o.w, now, rdt, st.status==='busy' && playing ? 'work' : 'idle'); }
+  for(const wk of walkers) poseWorker(wk.w, now, rdt, playing ? 'push' : 'idle');
+  const tR = now/1000;
+  for(const r of robots){
+    const st=lines[r.line].stations[r.id], busy = st.status==='busy' && playing;
+    if(r.kind==='xfer'){
+      // pick a cell off the conveyor end (straight ahead, +z) and place it into the stacking fixture (+x)
+      const yawPick = Math.atan2(-(-r.bz), 0), yawPlace = Math.atan2(-(-r.bz), 1.1);
+      if(busy){ r.ph = ((r.ph||0) + rdt/2.2) % 1; }
+      const p=r.ph||0;
+      let yaw, dip;
+      if(p<.2){ yaw=yawPick; dip=Math.sin(p/.2*Math.PI); }
+      else if(p<.5){ yaw=yawPick+(yawPlace-yawPick)*smooth((p-.2)/.3); dip=0; }
+      else if(p<.7){ yaw=yawPlace; dip=Math.sin((p-.5)/.2*Math.PI); }
+      else { yaw=yawPlace+(yawPick-yawPlace)*smooth((p-.7)/.3); dip=0; }
+      poseRobot(r.R, yaw, .75, dip);
+    } else {
+      // glue robot traces a bead along the cooling plate when a pack is in the station
+      if(busy){ r.ph = ((r.ph||0) + rdt/6) % 1; }
+      const p=r.ph||0, sweep = Math.sin(p*Math.PI*2);
+      poseRobot(r.R, Math.atan2(-(-r.bz), sweep*.75), busy? .95 : .5, busy? .55+.15*Math.sin(p*Math.PI*8) : 0);
+    }
+  }
+  for(const sp of sparks){
+    const busy = lines[sp.line].stations[sp.id].status==='busy' && playing;
+    const on = busy && Math.random()>.12;
+    sp.spark.visible = on; if(on){ sp.spark.position.x = Math.sin(tR*2.3)*.7; sp.spark.position.z=Math.sin(tR*5.1)*.12; sp.spark.scale.setScalar(.6+Math.random()*1.2); }
+    if(sp.light){ sp.light.intensity = on ? 1.5+Math.random()*3 : 0; sp.light.position.x = sp.spark.position.x; }
+  }
+  if(playing){
+    const v = V_CONV*Math.min(speed,4)*rdt;
+    BELT.cell.map.offset.x -= v/0.25; BELT.mod.map.offset.x -= v/0.25;
+    if(lines.some(l=>l.pack.items.some(i=>i.state==='move'))) BELT.roll.map.offset.x -= v/0.09;
+  }
+  if(agv && agv.g.userData.beacon) agv.g.userData.beacon.material.emissiveIntensity = (playing && agv.wait<=0 && blink) ? 2 : 0.1;
+}
+
 function setPath(v, pts){ v.path = pts.map(([x,y])=>new THREE.Vector3(wx(x),0,wz(y))); v.seg=0; v.s=0; }
 function stepVehicle(v, dt, onArrive){
-  if(v.wait>0){ v.wait-=dt; return; }
+  if(v.wait>0){
+    v.wait-=dt;
+    const car=v.g.userData.carriage;
+    if(car && v.lift){ const f=Math.min(1,Math.max(0,1-v.wait/v.waitT)); car.position.y = v.lift.h*Math.sin(Math.PI*smooth(f));
+      if(f>.5 && !v.lift.done){ v.g.userData.load.visible = !!v.lift.pick; v.lift.done=true; } }
+    if(v.wait<=0 && car){ car.position.y=0; v.lift=null; }
+    return;
+  }
   if(v.seg>=v.path.length-1){ onArrive(v); return; }
   const a=v.path[v.seg], b=v.path[v.seg+1], len=a.distanceTo(b)||1e-3;
-  v.s += 1.2*dt; // m/s
+  // ease in/out on each leg so vehicles do not start and stop instantly
+  const edge = Math.min(v.s, len - v.s);
+  v.s += (v.speed||1.3) * Math.min(1, .25 + edge/1.2) * dt;
   const u=Math.min(1,v.s/len);
   v.g.position.lerpVectors(a,b,u);
   const ang = Math.atan2(-(b.z-a.z), b.x-a.x); v.g.rotation.y += ((ang - v.g.rotation.y + Math.PI*3)%(Math.PI*2)-Math.PI)*Math.min(1,dt*4);
@@ -1727,13 +1938,19 @@ function build(key){
   scene.remove(root); root.traverse(o=>{ if(o.geometry && o.geometry!==geoBox && o.geometry!==cellGeo) o.geometry.dispose(); });
   root = new THREE.Group(); scene.add(root);
   labels.forEach(L=>L.el.remove()); labels=[];
+  workers=[]; robots=[]; sparks=[]; walkers=[];
   const [x0,x1,y0,y1]=cfg.bounds; W.cx=(x0+x1)/2; W.cy=(y0+y1)/2;
   buildBuilding(cfg);
   lines = []; for(let k=0;k<cfg.lines;k++) lines.push(buildLine(cfg,k));
   // vehicles
   forklift = makeVehicle('fork'); forklift.mode=0; forklift.idx=0; setPath(forklift, forkTrip(cfg,0));
   agv = makeVehicle('agv'); agv.mode=0; agv.idx=0; agv.g.userData.load.visible=false; agv.g.position.set(0,0,0);
-  const fin=cfg.rooms.find(r=>r[0]==='finTest'); agv.home=[(fin[1]+fin[2])/2,(fin[3]+fin[4])/2]; setPath(agv,[agv.home,agv.home]);
+  const fin=cfg.rooms.find(r=>r[0]==='finTest'); agv.home=[(fin[1]+fin[2])/2,(fin[3]+fin[4])/2]; setPath(agv,[agv.home,agv.home]); agv.speed=1.5;
+  forklift.speed=1.6;
+  { const z0=cfg.zones[0], zl=cfg.zones[cfg.zones.length-1], wh=cfg.rooms.find(r=>r[0]==='cellWH'), off=cfg.rooms.find(r=>r[0]==='office');
+    const westX=(cfg.bounds[0]+z0[0])/2+.3, eastX=(z0[1]+cfg.bounds[1])/2-.3, northY=(z0[3]+wh[3])/2-.4, southY=(zl[2]+off[4])/2;
+    const loop=[[westX,northY],[eastX,northY],[eastX,southY],[westX,southY]];
+    walkers.push(makeWalker(loop,0.05), makeWalker(loop,0.55)); }
   finished=[]; finishedCount=0; cellsTotal=0; simTime=0;
   focusLine=Math.min(focusLine,cfg.lines-1);
   document.getElementById('sub').textContent = `Factory layout 2026-06-11 · ${cfg.label} · ${cfg.lines} lines · ${cfg.lines*21} operators on line · ${cfg.buffer} cell buffer`;
@@ -1747,9 +1964,11 @@ function build(key){
 function stepLogistics(dt){
   // forklift: warehouse → line feed carts, cycling lines
   stepVehicle(forklift, dt, v=>{
-    if(v.mode===0){ v.g.userData.load.visible=false; v.wait=6; v.mode=1; setPath(v, forkTrip(cfg,v.idx).reverse()); }
-    else { v.g.userData.load.visible=true; v.wait=5; v.mode=0; v.idx=(v.idx+1)%cfg.lines; setPath(v, forkTrip(cfg,v.idx)); }
+    // at the line's cell cart: lower the crate onto it. At the rack: raise forks to a shelf and pull a crate.
+    if(v.mode===0){ v.wait=v.waitT=7; v.lift={h:.45, pick:false}; v.mode=1; setPath(v, forkTrip(cfg,v.idx).reverse()); }
+    else { v.wait=v.waitT=8; v.lift={h:[0,1.5,3.0][Math.floor(Math.random()*3)], pick:true}; v.mode=0; v.idx=(v.idx+1)%cfg.lines; setPath(v, forkTrip(cfg,v.idx)); }
   });
+  for(const wk of walkers) stepWalker(wk, dt);
   // AGV: collect finished packs from outfeed stands → finished pack test area
   stepVehicle(agv, dt, v=>{
     if(v.mode===0){ // at home, look for work
@@ -1793,14 +2012,9 @@ function updateStatus(dt){
         setStatus(s,status,dt);
       }
     }
-    // robot arm wiggle when busy
-    for(const id of ['glue','xfer']){ const a=S[id].group.userData.arm; if(a && S[id].status==='busy') a.rotation.y = Math.sin(performance.now()/300)*.8; }
   }
 }
-function setStatus(s, status, dt){
-  s.status=status; s[status]+=dt;
-  const c=COL[status]; if(s.beacon.material.color.getHex()!==c){ s.beacon.material.color.setHex(c); s.beacon.material.emissive.setHex(status==='busy'?0x0d3a20:0x000000); }
-}
+function setStatus(s, status, dt){ s.status=status; s[status]+=dt; }
 const fmtClock = t => { const h=Math.floor(t/3600), m=Math.floor(t/60)%60; return `${String(h).padStart(2,'0')}:${String(m).padStart(2,'0')}`; };
 function buildLineSel(){
   const el=document.getElementById('lineSel'); el.innerHTML='';
@@ -1921,11 +2135,13 @@ function frame(now){
   if(playing){
     let sdt = rdt*speed; const step=0.5;
     while(sdt>0){ const d=Math.min(step,sdt); sdt-=d; simTime+=d;
-      for(const l of lines){ stepCells(l,d); stepPackEntry(l); stepTrack(l,'mod',d); stepTrack(l,'pack',d); stepGantry(l,d); }
+      for(const l of lines){ stepCells(l,d); stepPackEntry(l); stepTrack(l,'mod',d); stepTrack(l,'pack',d); stepGantry(l,d); stepOffline(l,d); }
       updateStatus(d);
-      stepLogistics(d);
     }
+    // vehicles and people move at a believable pace: they follow sim time up to 4x, then cap
+    stepLogistics(rdt*Math.min(speed,4));
   }
+  animateVisuals(rdt, now);
   if(fly){ fly.t=Math.min(1,fly.t+rdt/1.1); const e=fly.t<.5?2*fly.t*fly.t:1-Math.pow(-2*fly.t+2,2)/2;
     controls.target.lerpVectors(fly.t0,fly.t1,e); camera.position.lerpVectors(fly.p0,fly.p1,e); if(fly.t>=1) fly=null; }
   updateFollow();
