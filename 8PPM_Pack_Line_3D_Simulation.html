@@ -117,8 +117,10 @@ select.btn{appearance:none;-webkit-appearance:none;padding-right:22px;background
         <option value="wh">Cell warehouse</option>
         <option value="follow">Follow a pack</option>
         <option value="top">Plan view</option>
+        <option value="site">Site &amp; surroundings</option>
+        <option value="gate">Gate &amp; dispatch dock</option>
       </select>
-      <button class="btn" id="walls" aria-pressed="false">Full walls</button>
+      <button class="btn" id="walls" aria-pressed="false">Low walls</button>
       <button class="btn" id="toggleSide" aria-expanded="true">Panel</button>
     </div>
   </header>
@@ -1285,16 +1287,27 @@ renderer.toneMapping = THREE.ACESFilmicToneMapping; renderer.toneMappingExposure
 renderer.shadowMap.enabled = true; renderer.shadowMap.type = THREE.PCFSoftShadowMap;
 stage.prepend(renderer.domElement);
 const scene = new THREE.Scene();
-const camera = new THREE.PerspectiveCamera(42,1,0.2,600);
+const camera = new THREE.PerspectiveCamera(42,1,0.2,1600);
 const controls = new THREE.OrbitControls(camera, renderer.domElement);
-controls.enableDamping = true; controls.dampingFactor = .08; controls.maxPolarAngle = Math.PI*0.495; controls.minDistance=3; controls.maxDistance=200;
+controls.enableDamping = true; controls.dampingFactor = .08; controls.maxPolarAngle = Math.PI*0.495; controls.minDistance=3; controls.maxDistance=420;
 const hemi = new THREE.HemisphereLight(0xffffff,0x8a9088,.75); scene.add(hemi);
 const sun = new THREE.DirectionalLight(0xffffff,.75); sun.position.set(-30,60,40); sun.castShadow=true;
 sun.shadow.mapSize.set(2048,2048); Object.assign(sun.shadow.camera,{left:-60,right:60,top:45,bottom:-45,near:1,far:200}); sun.shadow.bias=-0.0005;
 scene.add(sun); scene.add(sun.target);
+const skyGeo = new THREE.SphereGeometry(1200, 32, 20);
+const sky = new THREE.Mesh(skyGeo, new THREE.MeshBasicMaterial({vertexColors:true, side:THREE.BackSide, fog:false, depthWrite:false, toneMapped:false}));
+scene.add(sky);
+function paintSky(top, horizon, bottom){
+  const pos=skyGeo.attributes.position, cols=new Float32Array(pos.count*3), cT=new THREE.Color(top), cH=new THREE.Color(horizon), cB=new THREE.Color(bottom), c=new THREE.Color();
+  for(let i=0;i<pos.count;i++){ const y=pos.getY(i)/1200; if(y>=0) c.copy(cH).lerp(cT, Math.pow(y,.55)); else c.copy(cH).lerp(cB, Math.min(1,-y*5)); cols.set([c.r,c.g,c.b],i*3); }
+  skyGeo.setAttribute('color', new THREE.BufferAttribute(cols,3));
+}
 function applyTheme(){
-  const c = new THREE.Color(css('--scene')||'#dfe3dd'); scene.background = c; scene.fog = new THREE.Fog(c, 140, 320);
-  hemi.intensity = isDark()? .55 : .75;
+  const dark = isDark();
+  const horizon = dark ? '#2b3644' : '#dbe6ee';
+  paintSky(dark?'#0b1424':'#5f9fd6', horizon, dark?'#1a211d':'#cdd5cc');
+  const c = new THREE.Color(horizon); scene.background = c; scene.fog = new THREE.Fog(c, 260, 900);
+  hemi.intensity = dark? .45 : .75; sun.intensity = dark? .45 : .8;
 }
 applyTheme();
 matchMedia('(prefers-color-scheme: dark)').addEventListener('change', applyTheme);
@@ -1380,23 +1393,229 @@ function buildBuilding(o){
     const f = box(b-a,.02,d-c,mat('epoxy',0x6e9a7f,{roughness:.55}),wx((a+b)/2),.03,wz((c+d)/2),root,false); f.receiveShadow=true;
     laneRect(a,b,c,d);
   });
-  // outer walls
-  const wallMat = mat('wall',0xe9e9e4,{transparent:true,opacity:1});
-  const H = wallsFull ? 7.5 : 1.4; const t=.3;
-  wallsGroup = new THREE.Group(); root.add(wallsGroup);
-  const wm = wallsFull ? mat('wallGlass',0xe9e9e4,{transparent:true,opacity:.28,depthWrite:false}) : wallMat;
-  box(x1-x0+t, H, t, wm, wx((x0+x1)/2), H/2, wz(y0), wallsGroup);
-  box(x1-x0+t, H, t, wm, wx((x0+x1)/2), H/2, wz(y1), wallsGroup);
-  box(t, H, y1-y0, wm, wx(x0), H/2, wz((y0+y1)/2), wallsGroup);
-  box(t, H, y1-y0, wm, wx(x1), H/2, wz((y0+y1)/2), wallsGroup);
-  // structural columns along the long walls (approx. 9 m bays)
-  for(let x=x0; x<=x1+0.1; x+=(x1-x0)/8){ box(.6,H+.2,.6,mat('col',0xd4d4cf),wx(x),(H+.2)/2,wz(y0)); box(.6,H+.2,.6,mat('col',0xd4d4cf),wx(x),(H+.2)/2,wz(y1)); }
+  buildShell(o);
+  buildSite(o);
   // racks
   buildRacks(o.racks);
   // office desks
   for(const [x,y] of o.desks) deskCluster(x,y);
 }
-let wallsGroup=null, wallsFull=false;
+let wallsLow=false, shell=null, trucks=[], barrier=null;
+const EAVE = 8.5, RIDGE = 10.2;
+function canvasTex(w,h,draw){ const c=document.createElement('canvas'); c.width=w; c.height=h; draw(c.getContext('2d'),w,h); const t=new THREE.CanvasTexture(c); t.encoding=THREE.sRGBEncoding; t.anisotropy=4; return t; }
+function ribTex(len){ const t=canvasTex(32,4,(x,w,h)=>{ x.fillStyle='#e4e8ec'; x.fillRect(0,0,w,h); x.fillStyle='#c4ccd3'; x.fillRect(0,0,6,h); x.fillStyle='#f2f4f6'; x.fillRect(7,0,3,h); });
+  t.wrapS=t.wrapT=THREE.RepeatWrapping; t.repeat.set(len/0.33,1); return t; }
+function slatTex(){ const t=canvasTex(4,32,(x,w,h)=>{ x.fillStyle='#b9c2ca'; x.fillRect(0,0,w,h); x.fillStyle='#8e98a1'; x.fillRect(0,0,w,3); }); t.wrapS=t.wrapT=THREE.RepeatWrapping; t.repeat.set(1,22); return t; }
+
+/* building envelope: dado wall + ribbed cladding + window band, columns, roof trusses, high-bay lights, docks */
+function buildShell(o){
+  const [x0,x1,y0,y1]=o.bounds, wd=x1-x0, dp=y1-y0, t=.25;
+  const dado = mat('dado',0xc9c6bd,{roughness:.9}), steel = mat('steelCol',0x5f7182,{metalness:.45,roughness:.45});
+  const glass = mat('clerestory',0x9fc3dc,{roughness:.15,metalness:.2,emissive:0x1d3240,transparent:true,opacity:.85});
+  const cap = mat('eaveCap',0x4a5560,{metalness:.4,roughness:.5});
+  const cladL = new THREE.MeshStandardMaterial({map:ribTex(wd),roughness:.5,metalness:.35});
+  const cladS = new THREE.MeshStandardMaterial({map:ribTex(dp),roughness:.5,metalness:.35});
+  shell = {walls:[], roof:new THREE.Group(), x0,x1,y0,y1};
+  root.add(shell.roof);
+  const sides = [
+    {name:'S', len:wd, cx:(x0+x1)/2, cy:y0, along:'x', n:[0,-1], clad:cladL},
+    {name:'N', len:wd, cx:(x0+x1)/2, cy:y1, along:'x', n:[0, 1], clad:cladL},
+    {name:'W', len:dp, cx:x0, cy:(y0+y1)/2, along:'y', n:[-1,0], clad:cladS},
+    {name:'E', len:dp, cx:x1, cy:(y0+y1)/2, along:'y', n:[ 1,0], clad:cladS},
+  ];
+  for(const s of sides){
+    const X=wx(s.cx), Z=wz(s.cy), lx = s.along==='x'? s.len+t : t, lz = s.along==='x'? t : s.len;
+    box(lx,1.2,lz,dado,X,.6,Z);
+    const up = new THREE.Group(); root.add(up);
+    box(lx,EAVE-1.2,lz,s.clad,X,1.2+(EAVE-1.2)/2,Z,up);
+    const gw = s.along==='x'? [s.len*.94,1.1,t+.04] : [t+.04,1.1,s.len*.94];
+    box(gw[0],gw[1],gw[2],glass,X,5.9,Z,up,false);
+    box(s.along==='x'? s.len+.6 : .5, .35, s.along==='x'? .5 : s.len+.6, cap, X, EAVE+.17, Z, up);
+    // n = outward normal in drawing coords (x, y); world z is -y
+    shell.walls.push({up, nx:s.n[0], nz:-s.n[1], px:X, pz:Z});
+  }
+  // steel portal columns every ~9.4 m on the long walls, plus mid-columns on gable walls
+  const bays = 8;
+  for(let i=0;i<=bays;i++){
+    const x = x0 + i*wd/bays;
+    for(const y of [y0,y1]){ box(.42,EAVE+.1,.42,steel,wx(x),(EAVE+.1)/2,wz(y)+(y===y0?-.33:.33)); }
+    if(i%2===1){ // fire extinguisher + sign on alternate columns (inside face)
+      for(const y of [y0,y1]){ const zi = wz(y)+(y===y0?-.65:.65);
+        cyl(.09,.5,mat('fireExt',0xc8261c,{roughness:.4}),wx(x),.42,zi); box(.32,.32,.02,mat('fireSign',0xd8352a,{emissive:0x3a0a08}),wx(x),1.9,zi); }
+    }
+    // roof truss spanning the building (shown only from low camera angles)
+    const X=wx(x), zS=wz(y0), zN=wz(y1), zm=(zS+zN)/2, half=Math.abs(zN-zS)/2;
+    const rafter = Math.hypot(half, RIDGE-EAVE), ang=Math.atan2(RIDGE-EAVE, half);
+    const r1 = box(.18,.22,rafter,steel,X,(EAVE+RIDGE)/2+.2,(zS+zm)/2,shell.roof,false); r1.rotation.x = ang;
+    const r2 = box(.18,.22,rafter,steel,X,(EAVE+RIDGE)/2+.2,(zN+zm)/2,shell.roof,false); r2.rotation.x = -ang;
+    box(.12,.12,half*2,steel,X,EAVE,zm,shell.roof,false);
+    for(let k=1;k<8;k++){ const zz=zS+(zN-zS)*k/8, hh=(RIDGE-EAVE)*(1-Math.abs(zz-zm)/half); box(.08,hh+.2,.08,steel,X,EAVE+(hh+.2)/2,zz,shell.roof,false); }
+  }
+  // purlins
+  for(let k=0;k<=10;k++){ const yy=y0+dp*k/10, hh=EAVE+(RIDGE-EAVE)*(1-Math.abs(k-5)/5)+.35; box(wd,.1,.1,cap,wx((x0+x1)/2),hh,wz(yy),shell.roof,false); }
+  // high-bay LED lights hanging between trusses
+  const lampBody = mat('lampBody',0x30363c,{metalness:.5}), lampLens = new THREE.MeshStandardMaterial({color:0xffffff,emissive:0xfff3d6,emissiveIntensity:1.4});
+  for(let i=0;i<bays;i++) for(let k=1;k<7;k++){
+    const X=wx(x0+(i+.5)*wd/bays), Z=wz(y0+dp*k/7);
+    box(.02,1.2,.02,lampBody,X,EAVE-.1,Z,shell.roof,false);
+    const b=cyl(.32,.18,lampBody,X,7.35,Z,shell.roof); b.castShadow=false;
+    const l=new THREE.Mesh(new THREE.CylinderGeometry(.28,.28,.02,16),lampLens); l.position.set(X,7.25,Z); shell.roof.add(l);
+  }
+  // roll-up dock doors: inbound cells (north, at the cell warehouse) and dispatch (south, at finished goods staging)
+  const cw = o.rooms.find(r=>r[0]==='cellWH'), fs = o.rooms.find(r=>r[0]==='finStore');
+  shell.dockN = (cw[1]+cw[2])/2; shell.dockS = (fs[1]+fs[2])/2;
+  const doorM = new THREE.MeshStandardMaterial({map:slatTex(),roughness:.5,metalness:.4});
+  const yel = mat('dockYel',0xf2c200);
+  for(const [dx,dy,sgn,wallIdx] of [[shell.dockN,y1,1,1],[shell.dockS,y0,-1,0]]){
+    const up = shell.walls[wallIdx].up, Z = wz(dy) - sgn*.16;
+    box(3.8,4.4,.08,doorM,wx(dx),2.2,Z,up,false);
+    box(.12,4.6,.12,yel,wx(dx)-2,2.3,Z,up); box(.12,4.6,.12,yel,wx(dx)+2,2.3,Z,up);
+    // dock apron + bumpers outside (always visible)
+    box(4.2,.12,3.2,mat('dockPlate',0x7d858c,{metalness:.5}),wx(dx),-.2,wz(dy)-sgn*1.7);
+    box(.35,.4,.25,mat('bumperB',0x16181a),wx(dx)-1.5,.2,wz(dy)-sgn*.3); box(.35,.4,.25,mat('bumperB',0x16181a),wx(dx)+1.5,.2,wz(dy)-sgn*.3);
+    const canopy = box(5.5,.15,4,mat('canopy',0x9aa4ad,{metalness:.4}),wx(dx),4.9,wz(dy)-sgn*2,up);
+  }
+  addLabel('zone', wx(shell.dockN), .5, wz(y1)-6, 'Inbound cell dock', '', {});
+  addLabel('zone', wx(shell.dockS), .5, wz(y0)+6, 'Dispatch dock', '', {});
+  // electrical panels on the west wall, one per line, and an overhead cable tray along each line
+  o.dys.forEach((dy,k)=>{
+    box(.6,2.1,1.8,mat('panel',0x8c969e,{metalness:.3}),wx(x0)+.55,1.05,wz(UPPER_Y+dy));
+    const zT = wz((UPPER_Y+LOWER_Y)/2+dy), xa=wx(-125.5+o.dx), xb=wx(-74+o.dx);
+    box(xb-xa,.06,.4,mat('tray',0xaab2b9,{metalness:.6,roughness:.35}),(xa+xb)/2,6.6,zT,shell.roof,false);
+    for(let x=xa; x<=xb; x+=6) box(.04,EAVE-6.6,.04,mat('tray',0xaab2b9),x,6.6+(EAVE-6.6)/2,zT,shell.roof,false);
+    for(const xd of [xa+8, (xa+xb)/2, xb-6]) box(.12,6.6-2.3,.12,mat('tray',0xaab2b9),xd,2.3+(6.6-2.3)/2,zT,shell.roof,false); // drops to line panels
+  });
+}
+
+/* site around the building: ground, road ring, compound wall, gate, parking, utilities, trees, neighbours */
+function buildSite(o){
+  const [x0,x1,y0,y1]=o.bounds, cx=(x0+x1)/2, cy=(y0+y1)/2;
+  const R=14, C=26, gateX=x0+12;
+  shell.gateX=gateX; shell.R=R; shell.C=C;
+  const flat = (w,d,m,x,y,z)=>{ const p=box(w,.04,d,m,x,y,z,root,false); p.receiveShadow=true; return p; };
+  const grass = mat('grass',0x7f9a63,{roughness:1}), asph = mat('asphalt',0x3a3e42,{roughness:.95}), conc = mat('apron',0xb9b8b1,{roughness:.95});
+  const g = new THREE.Mesh(new THREE.PlaneGeometry(1400,1400), grass); g.rotation.x=-Math.PI/2; g.position.set(wx(cx),-.32,wz(cy)); g.receiveShadow=true; root.add(g);
+  // compound: paved yard inside the wall, concrete apron around building
+  flat(x1-x0+2*C, y1-y0+2*C, mat('yard',0x9a9c93,{roughness:1}), wx(cx), -.3, wz(cy));
+  flat(x1-x0+12, y1-y0+12, conc, wx(cx), -.28, wz(cy));
+  // ring road
+  const rw=7, mark=mat('roadMark',0xf3f3ef,{roughness:.6});
+  const road = (xa,ya,xb,yb)=>{ const horiz = Math.abs(yb-ya)<.01; const len = horiz? Math.abs(xb-xa)+rw : Math.abs(yb-ya)+rw;
+    flat(horiz?len:rw, horiz?rw:len, asph, wx((xa+xb)/2), -.26, wz((ya+yb)/2));
+    for(let s=-len/2+2; s<len/2-2; s+=6) box(horiz?3:.15,.01,horiz?.15:3,mark, wx((xa+xb)/2)+(horiz?s:0), -.235, wz((ya+yb)/2)+(horiz?0:-s), root,false); };
+  road(x0-R,y0-R,x1+R,y0-R); road(x0-R,y1+R,x1+R,y1+R); road(x0-R,y0-R,x0-R,y1+R); road(x1+R,y0-R,x1+R,y1+R);
+  road(gateX,y0-R,gateX,y0-C-6);
+  // public road outside the gate
+  flat(700, 10, asph, wx(cx), -.27, wz(y0-40));
+  for(let s=-340; s<340; s+=8) box(4,.01,.18,mark,wx(cx)+s,-.245,wz(y0-40),root,false);
+  // compound wall with gate opening
+  const wallM = mat('cwall',0xd9d4c7,{roughness:.9}), coping = mat('coping',0x9b8f7a);
+  const cwall = (xa,ya,xb,yb)=>{ const horiz=Math.abs(yb-ya)<.01, len=horiz?Math.abs(xb-xa):Math.abs(yb-ya); if(len<.5) return;
+    box(horiz?len:.25,2.2,horiz?.25:len,wallM,wx((xa+xb)/2),.8,wz((ya+yb)/2)); box(horiz?len:.35,.1,horiz?.35:len,coping,wx((xa+xb)/2),1.95,wz((ya+yb)/2)); };
+  const X0=x0-C, X1=x1+C, Y0=y0-C, Y1=y1+C;
+  cwall(X0,Y1,X1,Y1); cwall(X0,Y0,X0,Y1); cwall(X1,Y0,X1,Y1); cwall(X0,Y0,gateX-5,Y0); cwall(gateX+5,Y0,X1,Y0);
+  for(const gx of [gateX-5,gateX+5]) box(.7,3,.7,mat('gatePost',0x8a7f6c),wx(gx),1.2,wz(Y0));
+  // security cabin + boom barrier
+  box(3,2.8,3,mat('cabin',0xe8e3d6),wx(gateX-8),1.1,wz(Y0+3)); box(3.4,.2,3.4,mat('cabinRoof',0x8a3b2a),wx(gateX-8),2.6,wz(Y0+3));
+  box(2.4,.9,.05,mat('glassC',0x6f93ad,{roughness:.2}),wx(gateX-8),1.6,wz(Y0+3)+1.53,root,false);
+  const piv = new THREE.Group(); piv.position.set(wx(gateX-4.2),.9,wz(Y0+1)); root.add(piv);
+  box(.4,1,.4,mat('boomBase',0xe0a100),0,-.4,0,piv);
+  const arm = new THREE.Group(); piv.add(arm); arm.position.y=.15;
+  for(let i=0;i<8;i++) box(1,.12,.12,mat(i%2?'boomR':'boomW', i%2?0xc8261c:0xf5f5f0),.5+i,0,0,arm);
+  barrier = arm;
+  // site sign
+  const signTex = canvasTex(512,128,(x,w,h)=>{ x.fillStyle='#1f3a5a'; x.fillRect(0,0,w,h); x.fillStyle='#f2c200'; x.fillRect(0,h-14,w,14);
+    x.fillStyle='#ffffff'; x.font='bold 46px Arial, sans-serif'; x.textAlign='center'; x.fillText('BATTERY PACK PLANT',w/2,62); x.font='26px Arial, sans-serif'; x.fillText('8 PPM PACK ASSEMBLY',w/2,100); });
+  box(6,1.6,.15,new THREE.MeshStandardMaterial({map:signTex,roughness:.6}),wx(gateX+11),2.4,wz(Y0-2.5));
+  for(const sx of [-2.6,2.6]) box(.15,2.4,.15,mat('post',0x5b646c),wx(gateX+11)+sx,.9,wz(Y0-2.5));
+  // car parking south of the ring road, skipping the gate and the dispatch truck's turning lane
+  const carCols = [0xd8dadc,0x2b2f33,0x9a1f1f,0x2f4f7a,0xb8b9b4,0x6d7378,0xe8e6df];
+  const rnd = mulberry(11); let ci=0;
+  for(const [row, face] of [[y0-R-6,1],[y0-R-10.3,-1]]){
+    for(let x=gateX+22; x<x1+R-3; x+=2.8){
+      if(Math.abs(x-shell.dockS)<9) continue;
+      box(.08,.01,4.6,mark,wx(x-1.4),-.245,wz(row),root,false);
+      if(rnd()<.72) makeCar(wx(x), wz(row), face, carCols[(ci++)%carCols.length]);
+    }
+  }
+  addLabel('zone', wx(gateX+40), .5, wz(y0-R-8), 'Staff parking', '', {});
+  // two-wheeler shed (most staff commute by bike)
+  const shedX=gateX+9, shedY=y0-R-8.2;
+  box(10,.1,4.4,mat('shedRoof',0x5f8fa8,{metalness:.4}),wx(shedX),2.5,wz(shedY));
+  for(const [sx,sz] of [[-4.8,-2],[4.8,-2],[-4.8,2],[4.8,2]]) box(.08,2.5,.08,mat('post',0x5b646c),wx(shedX)+sx,1.0,wz(shedY)+sz);
+  for(let i=0;i<12;i++){ if(rnd()<.2) continue; const bx=wx(shedX-4.4+i*.8), bz=wz(shedY)+(i%2?.4:-.4);
+    box(.18,.55,1.7,mat('bike'+(i%3), [0x22262a,0x8a1c1c,0x2f4f7a][i%3]),bx,.05,bz); }
+  // utility yard on the east side: transformer and DG set behind a fence
+  const ux = x1+6, uy1 = y0+(y1-y0)*.35, uy2 = y0+(y1-y0)*.55;
+  const tr = box(2.6,2.3,2,mat('trafo',0x6e8a6a,{metalness:.3}),wx(ux),.85,wz(uy1));
+  for(let i=-3;i<=3;i++) box(.04,1.6,2.4,mat('trafo',0x6e8a6a),wx(ux)+i*.35,.7,wz(uy1));
+  for(const sx of [-.8,0,.8]) cyl(.08,.6,mat('bushing',0x8a5a3a),wx(ux)+sx,2.3,wz(uy1));
+  box(6.2,2.5,2.5,mat('dg',0x2d4e3b,{metalness:.3}),wx(ux),.95,wz(uy2)); cyl(.15,1.4,mat('exhaust',0x3a3e42),wx(ux)+2.4,2.9,wz(uy2));
+  const fence = mat('fence2',0x9aa1a6,{transparent:true,opacity:.55});
+  box(.05,2,(uy2-uy1)+6,fence,wx(ux-3.6),.7,wz((uy1+uy2)/2)); box(.05,2,(uy2-uy1)+6,fence,wx(ux+3.6),.7,wz((uy1+uy2)/2));
+  addLabel('zone', wx(ux), 3.5, wz((uy1+uy2)/2), 'Utility yard', '', {sub:'Transformer · DG set'});
+  // overhead water tank
+  const wtX=x1+R+8, wtY=y1+R+6;
+  for(const [sx,sz] of [[-1.6,-1.6],[1.6,-1.6],[-1.6,1.6],[1.6,1.6]]) box(.25,9,.25,mat('tankLeg',0xb7b3a8),wx(wtX)+sx,4.2,wz(wtY)+sz);
+  cyl(2.6,3,mat('tank',0xd9d4c7),wx(wtX),10,wz(wtY));
+  // trees along the compound wall and scattered outside
+  const trees=[];
+  const along=(xa,ya,xb,yb,step)=>{ const L=Math.hypot(xb-xa,yb-ya), n=Math.floor(L/step); for(let i=0;i<=n;i++){ const u=i/n; trees.push([xa+(xb-xa)*u, ya+(yb-ya)*u]); } };
+  along(X0+2.5,Y1-2.5,X1-2.5,Y1-2.5,9); along(X0+2.5,Y0+2.5,X0+2.5,Y1-2.5,9); along(X1-2.5,Y0+2.5,X1-2.5,Y1-2.5,9);
+  along(X0+2.5,Y0+2.5,gateX-12,Y0+2.5,8);
+  for(let i=0;i<70;i++){ const a=rnd()*Math.PI*2, r=C+35+rnd()*110; const tx=cx+Math.cos(a)*r*1.3, ty=cy+Math.sin(a)*r; if(Math.abs(ty-(y0-40))<9) continue; trees.push([tx,ty]); }
+  const trunk = new THREE.InstancedMesh(new THREE.CylinderGeometry(.18,.26,1,8), mat('trunk',0x6b4f36), trees.length);
+  const crown = new THREE.InstancedMesh(new THREE.IcosahedronGeometry(1,1), mat('crown',0xffffff,{roughness:.9,flatShading:true}), trees.length);
+  const m4=new THREE.Matrix4(), q=new THREE.Quaternion(), s=new THREE.Vector3(), p=new THREE.Vector3(), col=new THREE.Color();
+  trees.forEach(([tx,ty],i)=>{ const h=3+rnd()*2.5, cr=1.8+rnd()*1.4;
+    m4.compose(p.set(wx(tx),-.3+h/2,wz(ty)),q,s.set(1,h,1)); trunk.setMatrixAt(i,m4);
+    m4.compose(p.set(wx(tx),-.3+h+cr*.6,wz(ty)),q,s.set(cr,cr*.85,cr)); crown.setMatrixAt(i,m4);
+    crown.setColorAt(i, col.setHSL(.24+rnd()*.08,.38+rnd()*.15,.26+rnd()*.1)); });
+  trunk.castShadow=crown.castShadow=true; root.add(trunk); root.add(crown);
+  // neighbouring industrial sheds (industrial estate context)
+  const nb = [[x0-C-60, cy+10, 55, 40],[x1+C+55, cy-5, 45, 60],[cx-20, y1+C+55, 70, 35],[cx+70, y1+C+50, 40, 30],[cx-90, y0-75, 60, 35],[cx+40, y0-80, 80, 40]];
+  for(const [nx,ny,w,d] of nb){
+    box(w,9,d,mat('nbWall',0xc9ced2,{roughness:.7}),wx(nx),4.2,wz(ny));
+    const rf=box(w+1,.4,d+1,mat('nbRoof',0x8796a3,{metalness:.4,roughness:.5}),wx(nx),8.9,wz(ny));
+  }
+}
+function makeCar(x,z,face,color){
+  const g=new THREE.Group(); g.position.set(x,-.24,z); g.rotation.y = face>0?0:Math.PI; root.add(g);
+  box(1.75,.6,4.2,mat('car'+color.toString(16),color,{metalness:.55,roughness:.35}),0,.55,0,g);
+  box(1.55,.5,2.1,mat('carGlass',0x26313a,{metalness:.6,roughness:.15}),0,1.08,-.2,g);
+  for(const [sx,sz] of [[-.8,1.35],[.8,1.35],[-.8,-1.35],[.8,-1.35]]){ const w=cyl(.32,.22,mat('tyre',0x1b1d20),sx,.32,sz,g); w.rotation.z=Math.PI/2; }
+  return g;
+}
+function makeTruck(color){
+  const g=new THREE.Group(); root.add(g);
+  const tyreM = mat('tyre',0x1b1d20,{roughness:.9});
+  box(9.6,.35,2.3,mat('chassis',0x2a2e33),0,.75,0,g);
+  box(2.3,2.5,2.45,mat('cab'+color,color,{metalness:.4,roughness:.4}),3.85,2.05,0,g);
+  box(.06,.9,2.0,mat('carGlass',0x26313a),5.02,2.6,0,g);
+  box(7.2,2.9,2.5,mat('container',0xeceeef,{roughness:.6}),-1.1,2.5,0,g);
+  box(7.22,.35,2.52,mat('cStripe',0x1f3a5a),-1.1,3.2,0,g);
+  for(const x of [3.9,-2.6,-4.0]) for(const z of [-1.05,1.05]){ const w=cyl(.48,.35,tyreM,x,.48,z,g); w.rotation.x=Math.PI/2; }
+  g.traverse(o=>{ if(o.isMesh) o.castShadow=true; });
+  return {g, path:[], seg:0, s:0, wait:0, mode:0, speed:2.6, rev:[]};
+}
+function truckPaths(kind){
+  const [x0,x1,y0,y1]=cfg.bounds, R=shell.R, C=shell.C, G=shell.gateX, Y40=y0-40;
+  if(kind==='N'){ const d=shell.dockN;
+    return { arrive:[[x0-70,Y40],[G,Y40],[G,y0-R],[x0-R,y0-R],[x0-R,y1+R],[d-10,y1+R],[d+3,y1+21],[d,y1+5.6]],
+             leave:[[d,y1+5.6],[d,y1+R],[x1+R,y1+R],[x1+R,y0-R],[G,y0-R],[G,Y40],[x1+80,Y40]] }; }
+  const d=shell.dockS;
+  return { arrive:[[x1+80,Y40],[G,Y40],[G,y0-R],[d-10,y0-R],[d+3,y0-21],[d,y0-5.6]],
+           leave:[[d,y0-5.6],[d,y0-R],[G,y0-R],[G,Y40],[x0-70,Y40]] };
+}
+function updateShell(){
+  if(!shell) return;
+  const c = camera.position;
+  for(const w of shell.walls){
+    const outside = (c.x-w.px)*w.nx + (c.z-w.pz)*w.nz > 0;
+    w.up.visible = !wallsLow && !outside;
+  }
+  shell.roof.visible = c.y < 26;
+}
 function partition(xa,ya,xb,yb){
   const len = Math.hypot(xb-xa,yb-ya); if(len<.1) return;
   const m = box(xa===xb?.12:len, .9, xa===xb?len:.12, mat('part',0xd9dad4), wx((xa+xb)/2), .45, wz((ya+yb)/2)); m.castShadow=false;
@@ -1894,6 +2113,8 @@ function animateVisuals(rdt, now){
     BELT.cell.map.offset.x -= v/0.25; BELT.mod.map.offset.x -= v/0.25;
     if(lines.some(l=>l.pack.items.some(i=>i.state==='move'))) BELT.roll.map.offset.x -= v/0.09;
   }
+  if(barrier){ const near = trucks.some(t=>Math.hypot(t.g.position.x-wx(shell.gateX), t.g.position.z-wz(cfg.bounds[2]-shell.C))<16);
+    approach(barrier.rotation,'z', near? 1.45 : 0, Math.min(1, rdt*2.5)); }
   if(agv && agv.g.userData.beacon) agv.g.userData.beacon.material.emissiveIntensity = (playing && agv.wait<=0 && blink) ? 2 : 0.1;
 }
 
@@ -1914,7 +2135,7 @@ function stepVehicle(v, dt, onArrive){
   v.s += (v.speed||1.3) * Math.min(1, .25 + edge/1.2) * dt;
   const u=Math.min(1,v.s/len);
   v.g.position.lerpVectors(a,b,u);
-  const ang = Math.atan2(-(b.z-a.z), b.x-a.x); v.g.rotation.y += ((ang - v.g.rotation.y + Math.PI*3)%(Math.PI*2)-Math.PI)*Math.min(1,dt*4);
+  let ang = Math.atan2(-(b.z-a.z), b.x-a.x); if(v.rev && v.rev.includes(v.seg)) ang += Math.PI; v.g.rotation.y += ((ang - v.g.rotation.y + Math.PI*3)%(Math.PI*2)-Math.PI)*Math.min(1,dt*4);
   if(u>=1){ v.seg++; v.s=0; }
 }
 function forkTrip(o, k){
@@ -1938,7 +2159,7 @@ function build(key){
   scene.remove(root); root.traverse(o=>{ if(o.geometry && o.geometry!==geoBox && o.geometry!==cellGeo) o.geometry.dispose(); });
   root = new THREE.Group(); scene.add(root);
   labels.forEach(L=>L.el.remove()); labels=[];
-  workers=[]; robots=[]; sparks=[]; walkers=[];
+  workers=[]; robots=[]; sparks=[]; walkers=[]; trucks=[]; shell=null; barrier=null;
   const [x0,x1,y0,y1]=cfg.bounds; W.cx=(x0+x1)/2; W.cy=(y0+y1)/2;
   buildBuilding(cfg);
   lines = []; for(let k=0;k<cfg.lines;k++) lines.push(buildLine(cfg,k));
@@ -1947,6 +2168,12 @@ function build(key){
   agv = makeVehicle('agv'); agv.mode=0; agv.idx=0; agv.g.userData.load.visible=false; agv.g.position.set(0,0,0);
   const fin=cfg.rooms.find(r=>r[0]==='finTest'); agv.home=[(fin[1]+fin[2])/2,(fin[3]+fin[4])/2]; setPath(agv,[agv.home,agv.home]); agv.speed=1.5;
   forklift.speed=1.6;
+  trucks = [];
+  for(const [kind,col] of [['N',0x2f5d8a],['S',0xb03a2e]]){
+    const tk = makeTruck(col); tk.kind=kind; const P2=truckPaths(kind);
+    tk.mode=0; setPath(tk, P2.arrive); tk.rev=[P2.arrive.length-2]; tk.wait = kind==='N'? 2 : 30;
+    tk.g.position.copy(tk.path[0]); trucks.push(tk);
+  }
   { const z0=cfg.zones[0], zl=cfg.zones[cfg.zones.length-1], wh=cfg.rooms.find(r=>r[0]==='cellWH'), off=cfg.rooms.find(r=>r[0]==='office');
     const westX=(cfg.bounds[0]+z0[0])/2+.3, eastX=(z0[1]+cfg.bounds[1])/2-.3, northY=(z0[3]+wh[3])/2-.4, southY=(zl[2]+off[4])/2;
     const loop=[[westX,northY],[eastX,northY],[eastX,southY],[westX,southY]];
@@ -1969,6 +2196,11 @@ function stepLogistics(dt){
     else { v.wait=v.waitT=8; v.lift={h:[0,1.5,3.0][Math.floor(Math.random()*3)], pick:true}; v.mode=0; v.idx=(v.idx+1)%cfg.lines; setPath(v, forkTrip(cfg,v.idx)); }
   });
   for(const wk of walkers) stepWalker(wk, dt);
+  for(const tk of trucks) stepVehicle(tk, dt, v=>{
+    const P2 = truckPaths(v.kind);
+    if(v.mode===0){ v.wait=v.waitT=35; v.mode=1; setPath(v, P2.leave); v.rev=[]; }       // docked: unload / load, then leave
+    else { v.wait=v.waitT=30; v.mode=0; setPath(v, P2.arrive); v.rev=[P2.arrive.length-2]; } // off site, come back
+  });
   // AGV: collect finished packs from outfeed stands → finished pack test area
   stepVehicle(agv, dt, v=>{
     if(v.mode===0){ // at home, look for work
@@ -2081,6 +2313,8 @@ function setView(v, instant){
   const off = innerWidth>820 ? -wd*.13 : 0;
   if(v==='overview') flyTo(new THREE.Vector3(off,0,2), new THREE.Vector3(off-wd*.12, wd*.7, dp*1.15), instant);
   else if(v==='top') flyTo(new THREE.Vector3(0,0,0), new THREE.Vector3(0, wd*1.15, .01), instant);
+  else if(v==='site') flyTo(new THREE.Vector3(0,0,4), new THREE.Vector3(-wd*.95, wd*.85, dp*1.75), instant);
+  else if(v==='gate'){ const gx=wx(shell.gateX), gz=wz(y0-shell.R); flyTo(new THREE.Vector3(gx+12,0,gz), new THREE.Vector3(gx-14,13,gz+26), instant); }
   else if(v==='line'){ const x=l.X(-110); flyTo(new THREE.Vector3(x,0,l.Zu), new THREE.Vector3(x-4,9,l.Zu+12), instant); }
   else if(v==='pack'){ const x=l.X(-88); flyTo(new THREE.Vector3(x,0,l.Zl), new THREE.Vector3(x+2,9,l.Zl+13), instant); }
   else if(v==='wh'){ const r=cfg.rooms[0]; const cx=wx((r[1]+r[2])/2), cz=wz((r[3]+r[4])/2); flyTo(new THREE.Vector3(cx,1,cz), new THREE.Vector3(cx+6,14,cz+22), instant); }
@@ -2113,7 +2347,7 @@ playBtn.onclick=()=>{ playing=!playing; playBtn.innerHTML = playing?'❚❚ Paus
 document.getElementById('speed').onchange=e=>{ speed=+e.target.value; };
 document.getElementById('view').onchange=e=>setView(e.target.value);
 const wallsBtn=document.getElementById('walls');
-wallsBtn.onclick=()=>{ wallsFull=!wallsFull; wallsBtn.setAttribute('aria-pressed',wallsFull); wallsBtn.textContent = wallsFull?'Cutaway walls':'Full walls'; build(optKey); };
+wallsBtn.onclick=()=>{ wallsLow=!wallsLow; wallsBtn.setAttribute('aria-pressed',wallsLow); wallsBtn.textContent = wallsLow?'Auto walls':'Low walls'; };
 const toggleSide=document.getElementById('toggleSide');
 toggleSide.onclick=()=>{ const s=document.getElementById('side'); s.classList.toggle('collapsed'); toggleSide.setAttribute('aria-expanded', !s.classList.contains('collapsed')); };
 if(matchMedia('(max-width:820px)').matches){ document.getElementById('side').classList.add('collapsed'); toggleSide.setAttribute('aria-expanded','false'); }
@@ -2146,6 +2380,7 @@ function frame(now){
     controls.target.lerpVectors(fly.t0,fly.t1,e); camera.position.lerpVectors(fly.p0,fly.p1,e); if(fly.t>=1) fly=null; }
   updateFollow();
   controls.update();
+  updateShell();
   renderer.render(scene,camera);
   updateLabels();
   uiAcc+=rdt; if(uiAcc>.25){ uiAcc=0; refreshUI(); }
